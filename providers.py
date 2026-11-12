@@ -3,7 +3,8 @@ import json
 import os
 import urllib.error
 import urllib.request
-
+import time
+import threading
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
@@ -11,17 +12,69 @@ CONFIG = {
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
+RATE_INTERVAL = 7.0
+
+_rate_lock = threading.Lock()
+_next_request_at = 0.0
+
+
+def wait_for_api_slot():
+    global _next_request_at
+
+    with _rate_lock:
+        now = time.monotonic()
+
+        scheduled = max(now, _next_request_at)
+
+        _next_request_at = scheduled + RATE_INTERVAL
+
+    delay = scheduled - now
+
+    if delay > 0:
+        time.sleep(delay)
+
 
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    delays = [2, 4, 8]
+
+    for attempt in range(4):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                **headers
+            }
+        )
+
+        try:
+            wait_for_api_slot()
+
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+
+        except urllib.error.HTTPError as exc:
+            # Chi retry cac loi server tam thoi
+            retryable = exc.code in (500, 502, 503, 504)
+
+            if retryable and attempt < 3:
+                time.sleep(delays[attempt])
+                continue
+
+            raise RuntimeError(
+                f"Provider tra HTTP {exc.code}; "
+                "kiem tra model, key va quota."
+            ) from exc
+
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt < 3:
+                time.sleep(delays[attempt])
+                continue
+
+            raise RuntimeError(
+                f"Ket noi provider that bai: {type(exc).__name__}"
+            ) from exc
+
 
 
 class Provider:
